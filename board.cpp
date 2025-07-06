@@ -1,41 +1,74 @@
-
 #include "board.h"
+#include <cstring>
+#include <sstream>
 
 using namespace std;
 
 Board::Board(const std::string& fen){
-
     clearBoard();
+    gameInfo = 0ULL;
 
-    short state = 0;
-    int square = 0;
+    std::istringstream iss(fen);
+    std::string boardPart, turnPart, castlingPart, epPart, halfmovePart, fullmovePart;
 
-    for(int i = 0; i < fen.length(); i++){
-        if (state == 0){
-            if (fen[i] == '/') continue;
+    // Parse the FEN string
+    iss >> boardPart >> turnPart >> castlingPart >> epPart >> halfmovePart >> fullmovePart;
 
-            if (isdigit(fen[i])) {
-                square += fen[i] - '0';
-            } else if (fen[i] == ' '){
-                state++;
-            } else {
-                loadPiece(fen[i], square);
-                square++;
-            }
-            if (square == 64){
-                state++;
-            }
-        } else if (state == 1){
-            if (fen[i] == ' ') continue;
-            
-            gameInfo = fen[i] == 'w';
-            
-            state++;
-            // add state to account for move counter and castling rights
-        } else if (state == 2){
+    // 1. Piece placement
+    int square = 56; // Start at a8
+    for (char c : boardPart) {
+        if (c == '/') {
+            square -= 16; // Move to next rank
+        } else if (isdigit(c)) {
+            square += c - '0';
+        } else {
+            loadPiece(c, square);
+            square++;
         }
-
     }
+
+    // 2. Turn
+    if (turnPart == "w") {
+        gameInfo |= TURN_MASK; // White to move
+    } else if (turnPart == "b") {
+        gameInfo &= ~TURN_MASK; // Black to move
+    }
+
+    // 3. Castling rights
+    for (char c : castlingPart) {
+        switch (c) {
+            case 'K': gameInfo |= WK_CASTLE; break;
+            case 'Q': gameInfo |= WQ_CASTLE; break;
+            case 'k': gameInfo |= BK_CASTLE; break;
+            case 'q': gameInfo |= BQ_CASTLE; break;
+            case '-': break;
+        }
+    }
+    // 4. Move count (halfmove clock)
+    if (!halfmovePart.empty()) {
+        int moveCount = std::stoi(halfmovePart);
+        gameInfo &= ~MOVE_MASK;
+        gameInfo |= (moveCount << 6) & MOVE_MASK;
+    }
+    
+    // 5. En passant square
+    if (epPart != "-" && !epPart.empty()) {
+        char fileChar = epPart[0];
+        int file = fileChar - 'a';
+        // Store file in en passant bits
+        gameInfo &= ~(EP_IS_SET | EP_FILE_MASK);
+        gameInfo |= EP_IS_SET | ((file << EP_FILE_SHIFT) & EP_FILE_MASK);
+    } else {
+        // No en passant
+        gameInfo &= ~(EP_IS_SET | EP_FILE_MASK); // Clear old ep info
+    }
+
+    //     // 6. Fullmove number (optional, usually not needed for move generation)
+    // if (!fullmovePart.empty()) {
+    //     int fullmoveNumber = std::stoi(fullmovePart);
+    //     // You can store this in a member variable if you want, but it's not needed for move legality.
+    // }
+
 };
 
 Board::Board(const Board& other){
@@ -50,58 +83,153 @@ Board::Board(U64 otherPieceBB[8], const U16& otherGameInfo){
     gameInfo = otherGameInfo;
 }
 
-// assume move is legal
-Board Board::makeMove(const U16& move){
+int Board::getEnPassantSquare() const {
+    if (!(gameInfo & EP_IS_SET)) return -1; // No en passant square
 
-    U64 newPieceBB[8];
-    memcpy(newPieceBB, pieceBB, 8 * sizeof(U64));
+    int epCol = (gameInfo & EP_FILE_MASK) >> EP_FILE_SHIFT; // get en passant column from game info
+    int epRow = (friendlyColour() == nWhite) ? 5 : 2; // row 5 for white, 2 for black
+    return (epRow * 8 + epCol);
+}
 
-    U16 newGameInfo;
+void Board::applyMove(const U16& move, U64* pieceBBTarget, U16& gameInfoTarget, const Board& board) {
 
-    U8 from = getFrom(move);
-    U8 to = getTo(move);
-    U8 flags = getFlags(move);
+    U8 from = (move >> 6) & 0x3F;
+    U8 to = move & 0x3F;
+    // U8 flags = getFlags(move);
     
-    enumPiece pieceType = getPieceType(from);
-    enumPiece colourType = getColourType(from);
+    enumPiece piece = board.getPieceType(from);
+    enumPiece colour = board.getColourType(from);
 
-    newPieceBB[pieceType] &= ~(1ULL << from);  // clear "from" square
-    newPieceBB[pieceType] |= (1ULL << to);     // set "to" square
+    // remove the piece from the "from" square
+    pieceBBTarget[piece] &= ~(1ULL << from); 
+    pieceBBTarget[colour] &= ~(1ULL << from);
 
-    newPieceBB[colourType] &= ~(1ULL << from);
-    newPieceBB[colourType] |= (1ULL << to);
+    // capture logic
+    if (move & FLAG_CAPTURE) {
+        if (move & FLAG_EP_CAPTURE) {
+            // determine the square behind the captured pawn and remove pawn from the board
+            int enPassantSquare = (colour == nWhite) ? to - 8 : to + 8; 
+            pieceBBTarget[nPawns] &= ~(1ULL << enPassantSquare);
+            pieceBBTarget[(colour == nWhite ? nBlack : nWhite)] &= ~(1ULL << enPassantSquare);
+        } else {
+            enumPiece capturedPiece = board.getPieceType(to);
+            enumPiece capturedColour = board.getColourType(to);
 
-    newGameInfo = gameInfo ^ (1ULL << 0);  // change colours
+            pieceBBTarget[capturedPiece] &= ~(1ULL << to);
+            pieceBBTarget[capturedColour] &= ~(1ULL << to);
+            // reset halfmove clock
+            gameInfoTarget = gameInfoTarget & ~(MOVE_MASK);
+        }
+    }
 
-    // // castling rights logic
-    // if (pieceType == nKings){
-    //     // set both king side and queen side castling to zero, 
-    //     // shift and extra two bits depending on colour
-    //     newGameInfo = gameInfo & ~( 0b11 << (1 + 2 * (gameInfo & 1ULL)));
+    // pawn promotion logic
+    if (move & FLAG_PROMOTION) {
+        // add the promoted piece
+        int promotionType = (move >> 13) & 0x3; // bits 14-13: promotion type
+        int promotedPiece = nKnights + promotionType; // 0=knight, 1=bishop, 2=rook, 3=queen
+        pieceBBTarget[promotedPiece] |= (1ULL << to);
+        pieceBBTarget[colour] |= (1ULL << to);
+        // reset halfmove clock
+        gameInfoTarget &= ~MOVE_MASK;
+    } else {
+        pieceBBTarget[piece] |= (1ULL << to);
+        pieceBBTarget[colour] |= (1ULL << to);
+        if (piece == nPawns){
 
-    // }  else if (from == 56){          // top left square
-    //     newGameInfo &= ~(1ULL <<1);   // queen side black
+            if (abs((int)from - (int)to) == 16) {
+                // double pawn push
+                int file = to % 8; // get the file of the pawn
+                gameInfoTarget &= ~(EP_IS_SET | EP_FILE_MASK);
+                gameInfoTarget |= EP_IS_SET | ((file << EP_FILE_SHIFT) & EP_FILE_MASK);
+            } else {
+                gameInfoTarget &= ~(EP_IS_SET | EP_FILE_MASK); // clear en passant square if not a double pawn push
+            }
+            
+            // reset halfmove clock
+            gameInfoTarget &= ~MOVE_MASK;
+        } else{
+            // increment halfmove clock
+            gameInfoTarget = (gameInfoTarget & ~MOVE_MASK) | (((((gameInfoTarget & MOVE_MASK) >> 6) + 1) << 6) & MOVE_MASK);
+        }
+    }
 
-    // }  else if (from == 64){          // top right square
-    //     newGameInfo &= ~(1ULL <<2);   // king side black
+    // castling rights
+    if (piece == nKings) {
+        // remove castling rights for the king
+        if (colour == nWhite) {
+            gameInfoTarget &= ~(WK_CASTLE | WQ_CASTLE);
+        } else {
+            gameInfoTarget &= ~(BK_CASTLE | BQ_CASTLE);
+        }
+    } else if (piece == nRooks) {
+        // remove castling rights for the rook
+        if (colour == nWhite) {
+            if (from == 0) gameInfoTarget &= ~WQ_CASTLE; // a1 rook
+            if (from == 7) gameInfoTarget &= ~WK_CASTLE; // h1 rook
+        } else {
+            if (from == 56) gameInfoTarget &= ~BQ_CASTLE; // a8 rook
+            if (from == 63) gameInfoTarget &= ~BK_CASTLE; // h8 rook
+        }
+    }
+    // if castling, update the rook's position
+    if (move & FLAG_KING_CASTLE) {
+        if (colour == nWhite) {
+            if (to == 2) { // queenside castle
+                pieceBBTarget[nRooks] &= ~(1ULL << 0); // remove a1 rook
+                pieceBBTarget[nRooks] |= (1ULL << 3); // add d1 rook
+                pieceBBTarget[nWhite] &= ~(1ULL << 0);
+                pieceBBTarget[nWhite] |= (1ULL << 3);
+            } else if (to == 6) { // kingside castle
+                pieceBBTarget[nRooks] &= ~(1ULL << 7); // remove h1 rook
+                pieceBBTarget[nRooks] |= (1ULL << 5); //   add f1 rook     
+                pieceBBTarget[nWhite] &= ~(1ULL << 7);
+                pieceBBTarget[nWhite] |= (1ULL << 5);
+            }
+        } else {
+            if (to == 58) { // queenside castle
+                pieceBBTarget[nRooks] &= ~(1ULL << 56); // remove a8 rook
+                pieceBBTarget[nRooks] |= (1ULL << 59); // add d8 rook
+                pieceBBTarget[nBlack] &= ~(1ULL << 56);
+                pieceBBTarget[nBlack] |= (1ULL << 59);     
+            } else if (to == 62) { // kingside castle
+                pieceBBTarget[nRooks] &= ~(1ULL << 63); // remove h8 rook
+                pieceBBTarget[nRooks] |= (1ULL << 61); // add f8 rook
+                pieceBBTarget[nBlack] &= ~(1ULL << 63);
+                pieceBBTarget[nBlack] |= (1ULL << 61);
+            }
+        }
+    }   
 
-    // }  else if (from == 7){            // bottom right square
-    //     newGameInfo &= ~(1ULL <<3);    // queen side white
+    gameInfoTarget ^= TURN_MASK;  // switch turns
+}
 
-    // }  else if (from == 0){            // bottom left square
-    //     newGameInfo &= ~(1ULL <<4);    // king side white
-    // }
 
-    // // move counter logic
-    // if (pieceType != nPawns){ // must check if in check
-    //     newGameInfo = gameInfo + (1ULL << 5);   // increment move counter
-    // } else {
-    //     newGameInfo = gameInfo & 0x1F;          // reset move counter
-    // }
+bool Board::isInCheck() const {
+    return isInCheck(friendlyColour());
+}
 
-    Board board = Board(newPieceBB, newGameInfo);
+bool Board::isInCheck(U8 colour) const {
+    // Find the king's bitboard for the given colour
+    U64 kingBB = 0ULL;
+    U8 enemyColour;
 
-    return board;
+    if (colour == nWhite) {
+        kingBB = getWhiteKing();
+        enemyColour = nBlack;
+    } else {
+        kingBB = getBlackKing();
+        enemyColour = nWhite;
+    }
+
+    // If there is no king on the board, not in check (defensive)
+    if (kingBB == 0) return false;
+
+    // Use MoveGenerator to get all squares attacked by the enemy
+    MoveGenerator moveGen(MoveTables::instance());
+    U64 attacked = moveGen.attackedBB(*this, enemyColour);
+
+    // If the king's square is attacked, return true
+    return (kingBB & attacked) != 0;
 }
 
 void Board::clearBoard(){
@@ -111,7 +239,7 @@ void Board::clearBoard(){
 }
 
 void Board::displayBoard() const {
-    for (int r = 0; r < 8; r ++){
+    for (int r = 7; r >= 0; r --){
         for (int c = 0; c < 8; c ++){
 
             int square = r * 8 + c;
@@ -119,18 +247,52 @@ void Board::displayBoard() const {
         }
         std::cout<< "\n";
     }
-    coloursTurnToString();
+    // coloursTurnToString();
+    displayGameInfo();
+    std::cout << "------------------------\n";
+}
+
+void Board::displayGameInfo() const {
+    // Turn
+    std::cout << "Turn: " << ((gameInfo & TURN_MASK) ? "White" : "Black") << std::endl;
+
+    // Castling rights
+    std::cout << "Castling rights: ";
+    bool any = false;
+    if (gameInfo & WK_CASTLE) { std::cout << "K"; any = true; }
+    if (gameInfo & WQ_CASTLE) { std::cout << "Q"; any = true; }
+    if (gameInfo & BK_CASTLE) { std::cout << "k"; any = true; }
+    if (gameInfo & BQ_CASTLE) { std::cout << "q"; any = true; }
+    if (!any) std::cout << "-";
+    std::cout << std::endl;
+
+    // Halfmove clock
+    int halfmoveClock = (gameInfo & MOVE_MASK) >> MOVE_SHIFT;
+    std::cout << "Halfmove clock: " << halfmoveClock << std::endl;
+
+    // En passant square
+    int epFile = (gameInfo & EP_FILE_MASK) >> EP_FILE_SHIFT;
+    if ((gameInfo & EP_IS_SET) == 0) {
+        std::cout << "En passant: -" << std::endl;
+    } else {
+        char fileChar = 'a' + epFile;
+        int rank = (gameInfo & TURN_MASK) ? 6 : 3; // If white to move, ep is on rank 6; if black, rank 3
+        std::cout << "En passant: " << fileChar << rank << std::endl;
+    }
 }
 
 
-enumPiece Board::coloursTurn() const{
-    return (gameInfo & 1ULL) ? nBlack : nWhite;
-} 
+// enumPiece Board::coloursTurn() const{
+//     return (gameInfo & TURN_MASK) ? nWhite : nBlack;
+// } 
 
 void Board::coloursTurnToString() const{
-    string colour;
-    (gameInfo & 1ULL) ? colour = "Black" : colour = "White" ;
-    std::cout << colour << " to move!" << "\n\n";
+    // Display the current turn (1 for white, 0 for black)
+    if (gameInfo & TURN_MASK) {
+        std::cout << "White's turn" << std::endl;
+    } else {
+        std::cout << "Black's turn" << std::endl;
+    }
 }
 
 void Board::loadPiece(char piece, int square) {
@@ -152,19 +314,19 @@ void Board::loadPiece(char piece, int square) {
 }
 
 enumPiece Board::getPieceType(int square) const {
-    if ((getWhitePawns() | getBlackPawns()) >> square & 1){return nPawns;}
-    if ((getWhiteBishops() | getBlackBishops())>> square & 1){return nBishops;}
-    if ((getWhiteKnights() | getBlackKnights()) >> square & 1){return nKnights;}
-    if ((getWhiteRooks() | getBlackRooks()) >> square & 1){return nRooks;}
-    if ((getWhiteQueens() | getBlackQueens()) >> square & 1){return nQueens;}
-    if ((getWhiteKing() | getBlackKing()) >> square & 1){return nKings;}
+    if (pieceBB[nPawns] >> square & 1) return nPawns;
+    if (pieceBB[nBishops] >> square & 1) return nBishops;
+    if (pieceBB[nKnights] >> square & 1) return nKnights;
+    if (pieceBB[nRooks] >> square & 1) return nRooks;
+    if (pieceBB[nQueens] >> square & 1) return nQueens;
+    if (pieceBB[nKings] >> square & 1) return nKings;
     return nEmpty;
 }
 
 enumPiece Board::getColourType(int square) const {
     if (pieceBB[nWhite] >> square & 1){return nWhite;}
     if (pieceBB[nBlack] >> square & 1){return nBlack;}
-
+    // return nEmpty;
     throw std::invalid_argument( "received empty square");
 }
 
